@@ -68,114 +68,165 @@ class LinkedInBot {
         await this.page.goto(process.env.LINKEDIN_GROUP_URL!);
         await this.page.waitForTimeout(5000);
 
-        const MAX_CONNECTIONS_PER_DAY = 25;
-        let connectionsAttempted = 0;
-        const processedProfiles = new Set<string>();
+        // First collect all profile URLs from the group page
+        const profileUrls: string[] = [];
         let previousHeight = 0;
         let noNewContentCount = 0;
 
-        while (connectionsAttempted < MAX_CONNECTIONS_PER_DAY) {
-            const memberCards = await this.page.$$('.artdeco-list__item');
+        // Scroll and collect all URLs first
+        console.log('Collecting profile URLs...');
+        while (true) {
+            try {
+                // Get all member cards that are currently visible
+                const memberCards = await this.page.$$('.artdeco-list__item');
+                
+                for (const card of memberCards) {
+                    try {
+                        // Get profile URL and degree
+                        const profileUrl = await card.$eval('a[href*="/in/"]', (link: HTMLAnchorElement) => link.href)
+                            .catch(() => null);
+                        const degreeText = await card.$eval('.artdeco-entity-lockup__degree', el => el.textContent?.trim())
+                            .catch(() => null);
+                        
+                        if (profileUrl && 
+                            !profileUrls.includes(profileUrl) && 
+                            (!degreeText || (!degreeText.includes('1st') && !degreeText.includes('You')))) {
+                            profileUrls.push(profileUrl);
+                            console.log(`Added profile: ${profileUrl}`);
+                        }
+                    } catch (error) {
+                        continue; // Skip problematic cards
+                    }
+                }
+                
+                break
+
+                // Scroll logic
+                // console.log(`Collected ${profileUrls.length} profiles so far, scrolling for more...`);
+                // const currentHeight = await this.page.evaluate(() => document.body.scrollHeight);
+                // await this.page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+                // await this.randomDelay(2000, 4000);
+
+                // if (currentHeight === previousHeight) {
+                //     noNewContentCount++;
+                //     if (noNewContentCount >= 3) {
+                //         console.log('No new profiles found after 3 scroll attempts, finished collecting.');
+                //         break;
+                //     }
+                // } else {
+                //     noNewContentCount = 0;
+                // }
+                // previousHeight = currentHeight;
+
+            } catch (error) {
+                console.log('Error while collecting profiles:', error);
+                break;
+            }
+        }
+
+        console.log(`Total profiles collected: ${profileUrls.length}`);
+
+        // Now process each collected profile
+        const MAX_CONNECTIONS_PER_DAY = 25;
+        let connectionsAttempted = 0;
+
+        for (let i = 0; i < profileUrls.length; i++) {
+            if (connectionsAttempted >= MAX_CONNECTIONS_PER_DAY) {
+                console.log('Reached maximum connections for today');
+                break;
+            }
+
+            const profileUrl = profileUrls[i];
+            await this.randomDelay(2000, 4000);
+            console.log(`Processing profile ${i + 1}/${profileUrls.length}: ${profileUrl}`);
             
-            for (const card of memberCards) {
-                if (connectionsAttempted >= MAX_CONNECTIONS_PER_DAY) break;
+            const connected = await this.tryConnectWithProfile(profileUrl)
+                .catch(error => {
+                    console.log(`Failed to connect with profile ${profileUrl}:`, error);
+                    return false;
+                });
+
+            if (connected) {
+                connectionsAttempted++;
+                console.log(`Successfully connected! (${connectionsAttempted}/${MAX_CONNECTIONS_PER_DAY})`);
+            } else {
+                console.log(`Connection attempt failed. Moving to next profile.`);
+            }
+        }
+
+        console.log(`Finished processing profiles. Connected with ${connectionsAttempted} people.`);
+    }
+
+    // New method to handle profile connection attempts
+    private async tryConnectWithProfile(profileUrl: string): Promise<boolean> {
+        if (!this.page) throw new Error('Browser not initialized');
+
+        try {
+            await this.page.goto(profileUrl);
+            await this.page.waitForTimeout(2000);
+            let connected = false;
+
+            // Updated selector for the main connect button
+            console.log('Looking for direct Connect button...');
+            const connectButton = await this.page.$([
+                // Primary selector using exact classes and aria-label pattern
+                'button[id*="ember"].artdeco-button.artdeco-button--2.artdeco-button--primary[aria-label*="Invite"][aria-label*="to connect"]',
+                
+                // Backup selector with just the essential parts
+                'button.artdeco-button--primary[aria-label*="Invite"][id*="ember"]'
+            ].join(','));
+
+            if (connectButton) {
+                console.log('Found direct Connect button, attempting to click...');
+                
+                // Log button details for debugging
+                const buttonText = await connectButton.textContent();
+                const ariaLabel = await connectButton.getAttribute('aria-label');
+                const buttonId = await connectButton.getAttribute('id');
+                console.log(`Button found - Text: ${buttonText}, ID: ${buttonId}, Aria-label: ${ariaLabel}`);
 
                 try {
-                    // Check connection degree (look for text that indicates 3rd+ degree)
-                    const degreeText = await card.$eval('.artdeco-entity-lockup__degree', el => el.textContent?.trim());
-                    if (degreeText && (degreeText.includes('1st') || degreeText.includes('You'))) {
-                        console.log('Skipping 1st degree connection or self');
-                        continue;
-                    }
-
-                    // Modified clicking logic with longer timeouts
-                    const directConnectButton = await card.$('button:has-text("Connect")');
-                    if (directConnectButton) {
-                        console.log('Found direct Connect button on card, clicking...');
-                        await directConnectButton.click({ timeout: 60000 });
-                        await this.handleConnectionDialog();
-                        connectionsAttempted++;
-                        continue;
-                    }
-
-                    const profileUrl = await card.$eval('a[href*="/in/"]', (link: HTMLAnchorElement) => link.href);
-                    if (processedProfiles.has(profileUrl)) continue;
-
-                    await this.randomDelay(2000, 4000);
-                    console.log(`Visiting profile: ${profileUrl}`);
-                    await this.page.goto(profileUrl, { 
-                        timeout: 60000,
-                        waitUntil: 'networkidle' 
-                    });
-                    await this.page.waitForTimeout(3000);
-
-                    // Check if we're already connected
-                    const connectionStatus = await this.page.$eval('.pv-top-card', el => el.textContent);
-                    if (connectionStatus && (
-                        connectionStatus.includes('Connected') || 
-                        connectionStatus.includes('Pending') || 
-                        connectionStatus.includes('Message')
-                    )) {
-                        console.log('Already connected or pending, skipping...');
-                        processedProfiles.add(profileUrl);
-                        continue;
-                    }
-
-                    let connected = false;
-
-                    // Modified clicking logic for profile buttons
-                    if (!connected) {
-                        console.log('Trying More dropdown...');
-                        const moreButton = await this.page.$('button:has-text("More")');
-                        if (moreButton) {
-                            await moreButton.click({ timeout: 60000 });
-                            await this.page.waitForTimeout(2000);
-
-                            const connectInDropdown = await this.page.$('span.display-flex.t-normal.flex-1:has-text("Connect")');
-                            if (connectInDropdown) {
-                                console.log('Found Connect in dropdown, clicking...');
-                                await connectInDropdown.click({ timeout: 60000 });
-                                connected = await this.handleConnectionDialog();
-                            }
-                        }
-                    }
-
-                    if (connected) {
-                        console.log(`Connection request sent to profile: ${profileUrl}`);
-                        connectionsAttempted++;
-                    }
-
-                    processedProfiles.add(profileUrl);
-                    await this.randomDelay(2000, 4000);
-
-                } catch (error) {
-                    console.log(`Failed to process member card:`, error);
-                    await this.page.waitForTimeout(5000); // Added longer wait after error
-                    continue;
-                }
-            }
-
-            // Scroll logic remains the same
-            console.log('Scrolling to load more members...');
-            await this.page.evaluate(() => {
-                window.scrollTo(0, document.body.scrollHeight);
-            });
-            
-            await this.randomDelay(2000, 4000);
-
-            const currentHeight = await this.page.evaluate(() => document.body.scrollHeight);
-            if (currentHeight === previousHeight) {
-                noNewContentCount++;
-                if (noNewContentCount >= 3) {
-                    console.log('No new content after 3 scroll attempts, stopping...');
-                    break;
+                    await connectButton.click({ timeout: 60000, force: true });
+                    console.log('Successfully clicked Connect button');
+                    connected = await this.handleConnectionDialog();
+                } catch (clickError) {
+                    console.log('Failed to click button directly, trying JavaScript click...');
+                    await this.page.evaluate((button) => {
+                        (button as HTMLElement).click();
+                    }, connectButton);
+                    connected = await this.handleConnectionDialog();
                 }
             } else {
-                noNewContentCount = 0;
+                console.log('No direct connect button found, trying More dropdown...');
+                const moreButton = await this.page.$([
+                    'button.artdeco-dropdown__trigger[aria-label="More actions"]',
+                    'button[id*="profile-overflow-action"]',
+                    'button.artdeco-button--muted:has(span:text("More"))'
+                ].join(','));
+                
+                if (moreButton) {
+                    console.log('Found More button, clicking...');
+                    await moreButton.click();
+                    await this.page.waitForTimeout(2000);
+
+                    const connectOption = await this.page.$(
+                        'div.artdeco-dropdown__item[aria-label*="Invite"][aria-label*="connect"], ' + 
+                        'div.artdeco-dropdown__item:has(span:text("Connect"))'
+                    );
+                    
+                    if (connectOption) {
+                        console.log('Found Connect option in dropdown, clicking...');
+                        await connectOption.click({ timeout: 60000 });
+                        connected = await this.handleConnectionDialog();
+                    }
+                }
             }
 
-            previousHeight = currentHeight;
-            await this.page.waitForTimeout(2000);
+            return connected;
+
+        } catch (error) {
+            console.log(`Error while trying to connect with ${profileUrl}:`, error);
+            return false;
         }
     }
 
@@ -205,14 +256,24 @@ class LinkedInBot {
     private async handleConnectionDialog(): Promise<boolean> {
         try {
             await this.page?.waitForTimeout(2000);
-            const sendWithoutNoteButton = await this.page?.$('button:has-text("Send without a note")');
-            if (sendWithoutNoteButton) {
-                console.log('Clicking Send without note...');
-                await sendWithoutNoteButton.click({ timeout: 60000 });
+            
+            // Try multiple selectors for the "Send without note" button
+            const sendButton = await this.page?.$([
+                'button:has-text("Send without a note")',
+                'button:has-text("Send")',
+                'button[aria-label*="Send now"]',
+                'button.artdeco-button--primary:has-text("Send")'
+            ].join(','));
+
+            if (sendButton) {
+                console.log('Found Send button, clicking...');
+                await sendButton.click({ timeout: 60000 });
                 await this.page?.waitForTimeout(2000);
                 return true;
+            } else {
+                console.log('No send button found in dialog');
+                return false;
             }
-            return false;
         } catch (error) {
             console.log('Error handling connection dialog:', error);
             return false;
